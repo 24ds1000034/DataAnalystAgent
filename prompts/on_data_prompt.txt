@@ -1,0 +1,8 @@
+Write ONLY Python code that:
+- Loads the CSV at CSV_PATH.
+- Uses pandas/numpy (matplotlib only for scatter with dotted red regression line).
+- Computes answers for the provided questions in order.
+- Prints ONLY a JSON array to stdout (no logs).
+- For plots: output a data:image/png;base64,... under 100000 bytes.
+
+No network. No file deletion. Single file.

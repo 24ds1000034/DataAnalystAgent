@@ -1,0 +1,4 @@
+You are a quick-answer system.
+Given these questions and context, provide the most accurate direct answers possible.
+Respond ONLY in the JSON array format specified, without extra commentary.
+Questions: {questions}

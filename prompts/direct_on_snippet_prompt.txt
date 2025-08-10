@@ -1,0 +1,8 @@
+Answer directly from the given CSV snippet.
+
+Rules:
+- Use ONLY the snippet; if insufficient, answer null.
+- Plot/image requests: answer null.
+- Types: counts as integers >=0; correlations floats in [-1,1] rounded to 6 decimals; titles are non-empty strings.
+
+Return ONLY a JSON array with exactly one element per question.
