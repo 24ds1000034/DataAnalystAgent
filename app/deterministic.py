@@ -1,27 +1,14 @@
 # app/deterministic.py
 from __future__ import annotations
 """
-Deterministic track:
-- Loads any uploaded/derived CSVs (via loaders.try_load_known)
-- Optionally scrapes HTML tables from URLs found in the question/context
-- Picks relevant tables generically (no hardcoding)
-- Attempts common ops: count (with threshold & year filters), earliest title, correlation, scatter+regression
-- Writes clean intermediates:
-    deterministic_run_*/questions.txt
-    deterministic_run_*/sources.json
-    deterministic_run_*/metadata.json
-    deterministic_run_*/answers.json
-    deterministic_run_*/scraped_data/table_1.{csv,md} ...
-Returns: {"array":[...]} if it produced any answers; else {} so other tracks can take over.
+Generic deterministic track (complete):
+- Ingest uploaded/derived CSVs + HTML tables
+- Robust column matching & currency parsing
+- Supports: count, earliest, corr, scatter (PNG <100kB)
+- Caches column pairs so corr/plot use the same DF/columns
+- Writes clean intermediates under deterministic_run_*/
 """
-
-import io
-import os
-import re
-import math
-import json
-import time
-import base64
+import io, os, re, math, json, time, base64
 from typing import Dict, Any, List, Optional, Tuple
 
 import numpy as np
@@ -34,34 +21,30 @@ from bs4 import BeautifulSoup
 from .loaders import try_load_known
 
 
-# ---------- small utilities ----------
-
 def _b64_png(b: bytes) -> str:
     return "data:image/png;base64," + base64.b64encode(b).decode()
 
-def _opt_png(b: bytes, max_bytes: int = 100_000) -> bytes:
-    """Palette+resize to keep PNG under size budget."""
+
+def _opt_png(b: bytes, max_bytes=100_000) -> bytes:
     im = Image.open(io.BytesIO(b)).convert("P", palette=Image.ADAPTIVE, colors=128)
     out = io.BytesIO()
     im.save(out, format="PNG", optimize=True)
     data = out.getvalue()
     while len(data) > max_bytes and im.size[0] > 320:
-        w, h = im.size
-        im = im.resize((int(w * 0.9), int(h * 0.9)))
+        im = im.resize((int(im.size[0] * 0.9), int(im.size[1] * 0.9)))
         out = io.BytesIO()
         im.save(out, format="PNG", optimize=True)
         data = out.getvalue()
     return data
 
-def scatter_with_regression_b64(x, y, xlabel: str, ylabel: str, max_bytes: int = 100_000) -> Optional[str]:
-    """Make a scatter with dotted red regression line and return data URI (<=100KB) or None."""
-    x = np.asarray(x); y = np.asarray(y)
+
+def scatter_with_regression_b64(x, y, xlabel, ylabel, max_bytes=100_000):
+    x, y = np.asarray(x), np.asarray(y)
     m = ~np.isnan(x) & ~np.isnan(y)
     x, y = x[m], y[m]
     if x.size < 2 or y.size < 2:
         return None
     if x.size > 5000:
-        # keep representative subset if huge
         idx = np.linspace(0, x.size - 1, 5000).astype(int)
         x, y = x[idx], y[idx]
     slope, inter = np.polyfit(x, y, 1)
@@ -69,7 +52,8 @@ def scatter_with_regression_b64(x, y, xlabel: str, ylabel: str, max_bytes: int =
     ax = plt.gca()
     ax.scatter(x, y, s=8, alpha=0.7)
     ax.plot([x.min(), x.max()], [slope * x.min() + inter, slope * x.max() + inter], linestyle="--", color="red")
-    ax.set_xlabel(xlabel); ax.set_ylabel(ylabel)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
     fig.tight_layout()
     buf = io.BytesIO()
     fig.savefig(buf, format="png", bbox_inches="tight")
@@ -77,16 +61,16 @@ def scatter_with_regression_b64(x, y, xlabel: str, ylabel: str, max_bytes: int =
     return _b64_png(_opt_png(buf.getvalue(), max_bytes))
 
 
-# ---------- HTML table readers ----------
-
 _URL_RE = re.compile(r"https?://[^\s)]+", re.I)
 def extract_urls(text: str) -> List[str]:
     return _URL_RE.findall(text or "")
+
 
 def _flatten_cols(cols) -> List[str]:
     if isinstance(cols, pd.MultiIndex):
         return [" ".join([str(x) for x in tup if str(x) not in ("", "nan")]).strip() for tup in cols]
     return [str(c) for c in cols]
+
 
 _FOOTNOTE_RX = re.compile(r"\[[^\]]*\]")
 def _clean_header_names(names: List[str]) -> List[str]:
@@ -96,6 +80,7 @@ def _clean_header_names(names: List[str]) -> List[str]:
         s = re.sub(r"\s+", " ", s).strip()
         out.append(s)
     return out
+
 
 def _read_html_tables_lxml(html: str) -> List[pd.DataFrame]:
     try:
@@ -108,9 +93,7 @@ def _read_html_tables_lxml(html: str) -> List[pd.DataFrame]:
             continue
         df = df.copy()
         df.columns = _clean_header_names(_flatten_cols(df.columns))
-        # drop all-empty columns
         df = df.loc[:, ~(df.astype(str).apply(lambda s: s.str.strip()).eq("").all())]
-        # drop the header repeated as the first row (common on wikis)
         lower_cols = [c.lower() for c in df.columns]
         row_header = pd.Series(lower_cols, index=df.columns)
         norm = df.astype(str).apply(lambda s: s.str.strip().str.lower())
@@ -120,15 +103,15 @@ def _read_html_tables_lxml(html: str) -> List[pd.DataFrame]:
         dfs.append(df)
     return dfs
 
+
 def _text(el) -> str:
     return el.get_text(strip=True) if hasattr(el, "get_text") else str(el).strip()
 
+
 def read_all_html_tables_bs(html: str) -> List[pd.DataFrame]:
-    """Fallback HTML table extraction without lxml."""
     soup = BeautifulSoup(html, "html.parser")
     dfs: List[pd.DataFrame] = []
     for tbl in soup.find_all("table"):
-        # headers
         headers = []
         thead = tbl.find("thead")
         if thead:
@@ -137,7 +120,6 @@ def read_all_html_tables_bs(html: str) -> List[pd.DataFrame]:
             tr0 = tbl.find("tr")
             if tr0:
                 headers = [_text(th) for th in tr0.find_all(["th", "td"]) if _text(th)]
-        # rows
         rows = []
         trs = tbl.find_all("tr")
         start = 1 if headers and trs else 0
@@ -166,35 +148,36 @@ def read_all_html_tables_bs(html: str) -> List[pd.DataFrame]:
     return dfs
 
 
-# ---------- generic relevance scoring & parsing ----------
-
 def _norm(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", str(s).strip().lower())
 
+
 def _grams(s: str) -> set:
     s2 = _norm(s)
-    return set(s2[i:i+3] for i in range(max(1, len(s2)-2)))
+    return set(s2[i:i + 3] for i in range(max(1, len(s2) - 2)))
+
 
 def _sim(a: str, b: str) -> float:
     A, B = _grams(a), _grams(b)
     return (len(A & B) / len(A | B)) if (A and B) else 0.0
 
+
 _ARTICLE_RX = re.compile(r"^\s*(the|a|an)\s+", re.I)
 def _strip_articles(s: str) -> str:
     return _ARTICLE_RX.sub("", s or "").strip()
 
+
 def find_best_column(df: pd.DataFrame, name: str) -> Optional[str]:
-    """Return best-matching column name or None (slightly relaxed threshold, and strips leading 'the')."""
     name = _strip_articles(str(name or ""))
     cols = [str(c) for c in df.columns]
-    # exact case-insensitive
     for c in cols:
         if c.strip().lower() == name.strip().lower():
             return c
     if not cols:
         return None
     best = max(cols, key=lambda c: _sim(c, name))
-    return best if _sim(best, name) >= 0.30 else None  # relaxed from 0.35
+    return best if _sim(best, name) >= 0.30 else None  # relaxed threshold
+
 
 def parse_col_pair(q: str) -> Optional[Tuple[str, str]]:
     m = re.search(r"(?:between|of)\s+([A-Za-z0-9 _\-./]+?)\s+(?:and|&)\s+([A-Za-z0-9 _\-./]+)", q, re.I)
@@ -202,8 +185,8 @@ def parse_col_pair(q: str) -> Optional[Tuple[str, str]]:
         return None
     return (_strip_articles(m.group(1).strip()), _strip_articles(m.group(2).strip()))
 
+
 def parse_threshold(q: str) -> Optional[float]:
-    """Extract a monetary/amount threshold from the text, supporting b/bn/m/million/k/thousand."""
     m = re.search(r"\$?\s*([0-9][0-9,\.]*)\s*(b|bn|m|million|k|thousand)?", q, re.I)
     if not m:
         return None
@@ -217,33 +200,36 @@ def parse_threshold(q: str) -> Optional[float]:
         x *= 1_000
     return x
 
-def parse_year(q: str, which: str = "before") -> Optional[int]:
-    if which == "before":
-        m = re.search(r"(?:before|prior to)\s*(\d{4})", q, re.I)
-    else:
-        m = re.search(r"(?:after|from)\s*(\d{4})", q, re.I)
+
+def parse_year(q: str, which="before") -> Optional[int]:
+    m = re.search(r"(?:before|prior to)\s*(\d{4})" if which == "before" else r"(?:after|from)\s*(\d{4})", q, re.I)
     return int(m.group(1)) if m else None
+
 
 def wants_correlation(q: str) -> bool:
     return bool(re.search(r"\bcorrelat", q, re.I))
 
+
 def wants_scatter(q: str) -> bool:
     return bool(re.search(r"\bscatter\s*plot|\bscatterplot", q, re.I))
+
 
 def wants_count(q: str) -> bool:
     return bool(re.search(r"\bcount|how many\b", q, re.I))
 
+
 def wants_earliest(q: str) -> bool:
     return bool(re.search(r"\bearliest|first\b", q, re.I))
 
+
 _CRX = re.compile(r"[^\d\.\-]+")
 def to_num(s: pd.Series) -> pd.Series:
-    """Robust numeric coercion from mixed currency/text columns."""
     if s.dtype.kind in "biufc":
         return pd.to_numeric(s, errors="coerce")
     v = s.astype(str).str.replace(r"\s+", " ", regex=True).str.strip()
     v = v.str.replace(_CRX, "", regex=True)
     return pd.to_numeric(v, errors="coerce")
+
 
 TEXT_COL_HINTS = ("title", "film", "movie", "name")
 def normalize_df_for_storage(df: pd.DataFrame) -> pd.DataFrame:
@@ -254,6 +240,7 @@ def normalize_df_for_storage(df: pd.DataFrame) -> pd.DataFrame:
         if any(h in cn for h in TEXT_COL_HINTS):
             out[c] = out[c].astype(str).str.replace(r"\s+", " ", regex=True).str.strip()
     return out
+
 
 GENERIC = ["rank", "peak", "year", "date", "title", "name", "gross", "worldwide gross", "revenue", "amount", "total", "value", "price", "score"]
 def _terms(questions: List[str]) -> List[str]:
@@ -273,8 +260,10 @@ def _terms(questions: List[str]) -> List[str]:
     for w in t:
         lw = w.lower()
         if lw not in seen:
-            out.append(w); seen.add(lw)
+            out.append(w)
+            seen.add(lw)
     return out
+
 
 def _score(df: pd.DataFrame, terms: List[str]) -> float:
     cols = [str(c) for c in df.columns]
@@ -285,6 +274,7 @@ def _score(df: pd.DataFrame, terms: List[str]) -> float:
     bonus = min(0.3, math.log10(max(2, r)) / 20.0) + min(0.2, math.log10(max(2, c)) / 20.0)
     return sim + bonus
 
+
 def _best_overall(dfs: List[pd.DataFrame], questions: List[str]) -> int:
     terms = _terms(questions)
     best_i, best_s = 0, -1.0
@@ -294,13 +284,15 @@ def _best_overall(dfs: List[pd.DataFrame], questions: List[str]) -> int:
             best_s, best_i = s, i
     return best_i
 
+
 def _best_for(q: str, dfs: List[pd.DataFrame]) -> List[int]:
     ids = sorted(range(len(dfs)), key=lambda i: _score(dfs[i], _terms([q])), reverse=True)
     return ids[:3]
 
+
 def _pick_metric(df: pd.DataFrame) -> Optional[str]:
-    """Pick a likely metric column (big numbers, currency-ish names)."""
-    best = None; best_sc = -1.0
+    best = None
+    best_sc = -1.0
     for c in df.columns:
         s = pd.to_numeric(df[c], errors="coerce")
         nonna = s.dropna()
@@ -318,7 +310,10 @@ def _pick_metric(df: pd.DataFrame) -> Optional[str]:
     return best
 
 
-# ---------- main entry ----------
+def _pair_key(a: str, b: str) -> str:
+    a2, b2 = _strip_articles(a).lower().strip(), _strip_articles(b).lower().strip()
+    return a2 + "|" + b2
+
 
 async def try_answer_deterministic(
     questions: List[str],
@@ -327,10 +322,6 @@ async def try_answer_deterministic(
     budget_ms: int,
     context_text: str = ""
 ) -> Dict[str, Any]:
-    """
-    Return {"array":[...]} if any answers were produced; else {}.
-    Also persists clean intermediates under deterministic_run_*.
-    """
     run_id = time.strftime("%Y%m%d_%H%M%S")
     out_dir = os.path.join(workdir, f"deterministic_run_{run_id}")
     os.makedirs(out_dir, exist_ok=True)
@@ -341,7 +332,6 @@ async def try_answer_deterministic(
     with open(os.path.join(out_dir, "questions.txt"), "w", encoding="utf-8") as f:
         f.write("\n".join(qs))
 
-    # sources.json (no raw bytes)
     red = {"files": {}, "notes": sources.get("notes", [])}
     for name, meta in (sources.get("files") or {}).items():
         rm = {k: v for k, v in meta.items() if k != "bytes"}
@@ -352,13 +342,13 @@ async def try_answer_deterministic(
 
     dfs: List[pd.DataFrame] = []
 
-    # 1) Uploaded/known files
+    # Uploaded files
     file_dfs = try_load_known(sources.get("files", {}))
     for df in file_dfs.values():
         if isinstance(df, pd.DataFrame) and not df.empty:
             dfs.append(df)
 
-    # 2) URLs from question/context
+    # URLs
     urls: List[str] = []
     for q in qs:
         urls += extract_urls(q)
@@ -367,7 +357,7 @@ async def try_answer_deterministic(
     urls = [u for u in urls if not (u in seen or seen.add(u))]
     for u in urls:
         try:
-            r = requests.get(u, timeout=20, headers={"User-Agent": "DataAnalystAgent/0.4"})
+            r = requests.get(u, timeout=20, headers={"User-Agent": "DataAnalystAgent/0.5"})
             r.raise_for_status()
             page_html = r.text
             page_dfs = _read_html_tables_lxml(page_html) or read_all_html_tables_bs(page_html)
@@ -378,20 +368,18 @@ async def try_answer_deterministic(
             continue
 
     if not dfs:
-        # nothing to work with
         with open(os.path.join(out_dir, "answers.json"), "w", encoding="utf-8") as f:
             json.dump({}, f, indent=2)
         with open(os.path.join(out_dir, "metadata.json"), "w", encoding="utf-8") as f:
-            json.dump({"run_id": run_id, "timestamp": time.time(), "num_questions": len(qs),
-                       "num_dataframes": 0, "produced_any": False}, f, indent=2)
+            json.dump({"run_id": run_id, "timestamp": time.time(), "num_questions": len(qs), "num_dataframes": 0, "produced_any": False}, f, indent=2)
         return {}
 
-    # normalize for storage & matching
     dfs = [normalize_df_for_storage(df) for df in dfs]
 
     answers: List[Any] = []
     produced = False
     saved_indices: set[int] = set()
+    pair_cache: Dict[str, Tuple[int, str, str]] = {}  # key -> (df_idx, colA, colB)
 
     for q in qs:
         ans = None
@@ -400,30 +388,52 @@ async def try_answer_deterministic(
         if wants_correlation(q):
             pair = parse_col_pair(q)
             if pair:
-                for i in cand_ids:
+                key = _pair_key(*pair)
+                if key in pair_cache:
+                    i, a, b = pair_cache[key]
                     df = dfs[i]
-                    a = find_best_column(df, pair[0]); b = find_best_column(df, pair[1])
-                    if a and b:
-                        x = to_num(df[a]); y = to_num(df[b])
-                        if x.notna().sum() >= 2 and y.notna().sum() >= 2:
-                            ans = round(float(x.corr(y)), 6)
-                            saved_indices.add(i)
-                            break
+                    x = to_num(df[a]); y = to_num(df[b])
+                    if x.notna().sum() >= 2 and y.notna().sum() >= 2:
+                        ans = round(float(x.corr(y)), 6)
+                if ans is None:
+                    search_ids = cand_ids + [k for k in range(len(dfs)) if k not in cand_ids]
+                    for i in search_ids:
+                        df = dfs[i]
+                        a = find_best_column(df, pair[0]); b = find_best_column(df, pair[1])
+                        if a and b:
+                            x = to_num(df[a]); y = to_num(df[b])
+                            if x.notna().sum() >= 2 and y.notna().sum() >= 2:
+                                ans = round(float(x.corr(y)), 6)
+                                pair_cache[key] = (i, a, b)
+                                saved_indices.add(i)
+                                break
             answers.append(ans); produced |= (ans is not None)
             continue
 
         if wants_scatter(q):
             pair = parse_col_pair(q)
             if pair:
-                for i in cand_ids:
+                key = _pair_key(*pair)
+                done = False
+                if key in pair_cache:
+                    i, a, b = pair_cache[key]
                     df = dfs[i]
-                    a = find_best_column(df, pair[0]); b = find_best_column(df, pair[1])
-                    if a and b:
-                        x = to_num(df[a]); y = to_num(df[b]); m = x.notna() & y.notna()
-                        if m.sum() >= 2:
-                            ans = scatter_with_regression_b64(x[m].values, y[m].values, a, b, 100_000)
-                            saved_indices.add(i)
-                            break
+                    x = to_num(df[a]); y = to_num(df[b]); m = x.notna() & y.notna()
+                    if m.sum() >= 2:
+                        ans = scatter_with_regression_b64(x[m].values, y[m].values, a, b, 100_000)
+                        saved_indices.add(i); done = True
+                if not done:
+                    search_ids = cand_ids + [k for k in range(len(dfs)) if k not in cand_ids]
+                    for i in search_ids:
+                        df = dfs[i]
+                        a = find_best_column(df, pair[0]); b = find_best_column(df, pair[1])
+                        if a and b:
+                            x = to_num(df[a]); y = to_num(df[b]); m = x.notna() & y.notna()
+                            if m.sum() >= 2:
+                                ans = scatter_with_regression_b64(x[m].values, y[m].values, a, b, 100_000)
+                                pair_cache[key] = (i, a, b)
+                                saved_indices.add(i)
+                                break
             answers.append(ans); produced |= (ans is not None)
             continue
 
@@ -433,7 +443,8 @@ async def try_answer_deterministic(
             after = parse_year(q, "after")
             if thr is not None:
                 best = None; best_i = None
-                for i in cand_ids:
+                search_ids = cand_ids + [k for k in range(len(dfs)) if k not in cand_ids]
+                for i in search_ids:
                     df = dfs[i]
                     metric = _pick_metric(df)
                     if not metric:
@@ -461,7 +472,8 @@ async def try_answer_deterministic(
             thr = parse_threshold(q)
             if thr is not None:
                 best_title = None; best_year = 10**9; best_i = None
-                for i in cand_ids:
+                search_ids = cand_ids + [k for k in range(len(dfs)) if k not in cand_ids]
+                for i in search_ids:
                     df = dfs[i]
                     metric = _pick_metric(df)
                     if not metric:
@@ -502,10 +514,8 @@ async def try_answer_deterministic(
             answers.append(ans); produced |= (ans is not None)
             continue
 
-        # unknown question type → leave None
         answers.append(None)
 
-    # persist a couple of representative tables
     if saved_indices:
         for n, i in enumerate(sorted(saved_indices), start=1):
             df = dfs[i]
@@ -521,17 +531,13 @@ async def try_answer_deterministic(
     with open(os.path.join(out_dir, "answers.json"), "w", encoding="utf-8") as f:
         json.dump(res, f, indent=2)
     with open(os.path.join(out_dir, "metadata.json"), "w", encoding="utf-8") as f:
-        json.dump({
-            "run_id": run_id,
-            "timestamp": time.time(),
-            "num_questions": len(qs),
-            "produced_any": produced,
-            "saved_tables": max(1, len(saved_indices))
-        }, f, indent=2)
+        json.dump(
+            {"run_id": run_id, "timestamp": time.time(), "num_questions": len(qs), "produced_any": produced, "saved_tables": max(1, len(saved_indices))},
+            f,
+            indent=2,
+        )
     return res
 
-
-# ---------- markdown writer ----------
 
 def _write_md(df: pd.DataFrame, path: str) -> None:
     cols = list(map(str, df.columns))

@@ -1,91 +1,193 @@
 from __future__ import annotations
+import os
+import json
+import time
 import asyncio
-from typing import Dict, Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 from .contract import build_contract
-from .planner import build_plan
-from .fetcher import prepare_sources
 from .deterministic import try_answer_deterministic
-from .llm_direct import answer_with_llm_direct
-from .llm_on_data import small_sample_insights
-from .gen_code import run_codegen
-from .image_fallback import image_base64_track
-from .duckdb_track import run_duckdb_targets
-from .llm_adjudicator import final_llm_adjudicate
-from .utils import validate_and_finalize, now_ms
+
+# Optional tracks (loaded lazily)
+try:
+    from .gen_code import generate_and_run as codegen_generate_and_run  # type: ignore
+except Exception:
+    codegen_generate_and_run = None
+
+try:
+    from .llm_direct import try_answer_on_snippet  # type: ignore
+except Exception:
+    try_answer_on_snippet = None
+
+GRAPH_QTYPES = {
+    "graph_edge_count",
+    "graph_highest_degree",
+    "graph_average_degree",
+    "graph_density",
+    "graph_shortest_path",
+    "graph_plot",
+    "graph_degree_histogram",
+}
+PLOT_QTYPES = {"scatter", "graph_plot", "graph_degree_histogram"}
+
+def _mk_sources(uploaded_files: Dict[str, bytes]) -> Dict[str, Any]:
+    files: Dict[str, Dict[str, Any]] = {}
+    for name, b in (uploaded_files or {}).items():
+        files[name] = {
+            "filename": name,
+            "mimetype": _guess_mime(name),
+            "bytes": b,
+            "size": len(b or b""),
+        }
+    return {"files": files, "notes": []}
+
+def _guess_mime(name: str) -> str:
+    n = (name or "").lower()
+    if n.endswith(".csv"): return "text/csv"
+    if n.endswith(".json"): return "application/json"
+    if n.endswith(".xlsx"): return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    if n.endswith(".xls"): return "application/vnd.ms-excel"
+    if n.endswith(".zip"): return "application/zip"
+    if n.endswith(".png"): return "image/png"
+    if n.endswith(".jpg") or n.endswith(".jpeg"): return "image/jpeg"
+    if n.endswith(".parquet"): return "application/octet-stream"
+    return "application/octet-stream"
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+def _is_data_uri_png(v: Any) -> bool:
+    return isinstance(v, str) and v.startswith("data:image/png;base64,")
+
+def _valid_by_qtype(qtype: str, val: Any) -> bool:
+    if val is None:
+        return True
+    if qtype == "count":
+        return isinstance(val, int) and val >= 0
+    if qtype == "corr":
+        return isinstance(val, (int, float)) and -1.0 <= float(val) <= 1.0
+    if qtype == "earliest":
+        return isinstance(val, str) and bool(val.strip())
+    if qtype == "scatter":
+        return _is_data_uri_png(val)
+    if qtype in GRAPH_QTYPES:
+        if qtype == "graph_edge_count": return isinstance(val, int) and val >= 0
+        if qtype in {"graph_average_degree", "graph_density"}: return isinstance(val, (int, float))
+        if qtype == "graph_highest_degree": return isinstance(val, (str, int, float))
+        if qtype == "graph_shortest_path": return isinstance(val, list) or val is None
+        if qtype in {"graph_plot", "graph_degree_histogram"}: return _is_data_uri_png(val)
+    return isinstance(val, (str, int, float, bool))
+
+def _pick_consensus(candidates: List[Any], qtype: str) -> Any:
+    # Priority: deterministic > codegen > llm_direct
+    for v in candidates:
+        if v is not None and _valid_by_qtype(qtype, v):
+            return v
+    return None
+
+def _finalize_shape(
+    out_type: str,
+    questions: List[str],
+    object_keys: Optional[List[str]],
+    merged: List[Any],
+) -> Any:
+    n = len(questions)
+    arr = list(merged[:n]) + [None] * max(0, n - len(merged))
+    if out_type == "object" and object_keys:
+        if len(object_keys) > len(arr):
+            arr += [None] * (len(object_keys) - len(arr))
+        return {k: arr[i] for i, k in enumerate(object_keys)}
+    return arr
 
 async def run_request(
     question_text: str,
     uploaded_files: Dict[str, bytes],
     json_attachments: List[Dict[str, Any]],
-    schema: Optional[Dict[str, Any]],
+    schema: Dict[str, Any],
     request_id: str,
     workdir: str,
-    return_envelope: bool=False,
-):
-    t0 = now_ms()
+) -> Any:
+    """
+    Returns ONLY the final raw payload:
+      - array of length == #questions by default, OR
+      - object with exactly the requested keys if explicitly asked in the prompt.
+    """
+    t0 = _now_ms()
 
-    # 1) Decide contract (format + questions)
+    # 1) Contract (decide output + questions + qtypes)
     contract = await build_contract(question_text, workdir)
-    questions: List[str] = contract.get("questions") or []
-    if not questions:
-        questions = [question_text.strip()] if question_text and question_text.strip() else []
-    questions_len = len(questions)
+    out_type = (contract.get("output") or {}).get("type", "array")
+    questions: List[str] = contract.get("questions") or [question_text.strip()]
+    qtypes: List[str] = contract.get("qtypes") or ["generic"] * len(questions)
+    object_keys: Optional[List[str]] = contract.get("object_keys")
 
-    final_schema = schema or contract.get("output") or {"type":"array"}
-    if isinstance(final_schema, dict) and "type" not in final_schema:
-        final_schema["type"] = "array"
+    # 2) Normalize to default array unless the prompt explicitly requested object
+    if out_type not in ("array", "object"):
+        out_type = "array"
+        object_keys = None
 
-    # 2) Planner (LLM) for strategies
-    plan = await build_plan(question_text, uploaded_files, workdir)
+    # 3) Sources
+    sources = _mk_sources(uploaded_files)
 
-    # 3) Prepare uploaded/json sources
-    sources = await asyncio.to_thread(prepare_sources, uploaded_files, json_attachments, workdir, 35_000)
+    # 4) Decide tracks
+    run_deterministic = True
+    need_codegen = any(qt in GRAPH_QTYPES or qt in {"corr", "scatter"} for qt in qtypes)
+    need_llm_direct = True
 
-    # 4) Conditional ladder + parallel forks
-    budgets = dict(deterministic=45_000, direct=14_000, on_data=18_000, codegen=28_000, image=4_000, duckdb=35_000, adjudicate=8_000)
+    # 5) Launch tasks in parallel
+    tasks: Dict[str, asyncio.Task] = {}
+    if run_deterministic:
+        tasks["deterministic"] = asyncio.create_task(
+            try_answer_deterministic(questions, sources, workdir, 60_000, question_text)
+        )
+    if need_llm_direct and try_answer_on_snippet is not None:
+        try:
+            tasks["llm_direct"] = asyncio.create_task(
+                try_answer_on_snippet(questions, sources, workdir, 30_000)
+            )
+        except Exception:
+            pass
+    if need_codegen and codegen_generate_and_run is not None:
+        try:
+            tasks["codegen"] = asyncio.create_task(
+                codegen_generate_and_run(questions, qtypes, sources, workdir, 45_000)
+            )
+        except Exception:
+            pass
 
-    # Kick off always-useful forks
-    det_task    = asyncio.create_task(try_answer_deterministic(questions, sources, workdir, budgets["deterministic"], context_text=question_text))
-    direct_task = asyncio.create_task(answer_with_llm_direct(questions, workdir, budgets["direct"], question_text=question_text))
-    ondata_task = asyncio.create_task(small_sample_insights(questions, sources, workdir, budgets["on_data"]))
-    code_task   = asyncio.create_task(run_codegen(questions, workdir, budgets["codegen"]))
-    image_task  = asyncio.create_task(image_base64_track(questions, workdir, budgets["image"]))
+    done, pending = await asyncio.wait(tasks.values(), timeout=170, return_when=asyncio.ALL_COMPLETED)
+    for p in pending:
+        p.cancel()
 
-    # If DuckDB is needed, materialize CSVs early
-    duckdb_needed = any(t.get("strategy") == "duckdb_parquet" for t in (plan.get("targets") or []))
-    if duckdb_needed:
-        duck_task = asyncio.create_task(run_duckdb_targets(plan, workdir, budgets["duckdb"]))
-        await duck_task
-        # re-trigger direct LLM quickly to pick up fresh CSVs
-        direct_task = asyncio.create_task(answer_with_llm_direct(questions, workdir, 6_000, question_text=question_text))
+    # 6) Collect outputs
+    track_outputs: Dict[str, Dict[str, Any]] = {}
+    for name, t in tasks.items():
+        try:
+            res = t.result()
+            if isinstance(res, dict):
+                track_outputs[name] = res
+        except Exception as e:
+            track_outputs[name] = {"error": str(e)}
 
-    direct_res, ondata_res, det_res, code_res, img_res = await asyncio.gather(direct_task, ondata_task, det_task, code_task, image_task)
+    # 7) Merge candidates per question index
+    num_q = len(questions)
+    merged: List[Any] = []
+    for i in range(num_q):
+        ordered = []
+        for trk in ("deterministic", "codegen", "llm_direct"):
+            arr = (track_outputs.get(trk) or {}).get("array")
+            if isinstance(arr, list) and i < len(arr):
+                ordered.append(arr[i])
+        qtype = qtypes[i] if i < len(qtypes) else "generic"
+        merged.append(_pick_consensus(ordered, qtype))
 
-    def to_array(res: Dict[str, Any]) -> List[Any]:
-        if isinstance(res, dict):
-            for k in ("array","data","result"):
-                v = res.get(k)
-                if isinstance(v, list):
-                    return (v + [None]*questions_len)[:questions_len]
-        return [None] * questions_len
+    # 8) Enforce exact final shape & persist snapshot for debugging
+    final_payload = _finalize_shape(out_type, questions, object_keys, merged)
+    adj_dir = os.path.join(workdir, f"adjudicator_run_{time.strftime('%Y%m%d_%H%M%S')}")
+    os.makedirs(adj_dir, exist_ok=True)
+    with open(os.path.join(adj_dir, "final.json"), "w", encoding="utf-8") as f:
+        json.dump(final_payload, f, indent=2)
 
-    track_arrays = {
-        "direct": to_array(direct_res),
-        "on_data": to_array(ondata_res),
-        "deterministic": to_array(det_res),
-        "codegen": to_array(code_res),
-        "image": to_array(img_res),
-    }
-
-    final_array = await final_llm_adjudicate(questions, track_arrays, workdir, budgets["adjudicate"])
-
-    result = validate_and_finalize(
-        final_array,
-        final_schema,
-        elapsed_ms=now_ms() - t0,
-        envelope=return_envelope,
-        questions_len=questions_len,
-        object_keys=contract.get("object_keys"),
-    )
-    return result
+    # 9) Return ONLY raw payload (array/object), nothing else
+    _ = t0  # elapsed kept in artifacts only
+    return final_payload

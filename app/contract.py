@@ -5,7 +5,6 @@ from typing import Any, Dict, List, Optional
 _NUM = re.compile(r"^\s*(\d+)[\.\)]\s+(.*\S)\s*$")
 _BUL = re.compile(r"^\s*[-*]\s+(.*\S)\s*$", re.M)
 _CODE_FENCE = re.compile(r"```(json|JSON)?\s*([\s\S]*?)```", re.M)
-_JSON_OBJECT_LIKE = re.compile(r"\{\s*\"[^\"]+\"\s*:", re.S)
 
 # Graph lexicon → graph_* qtypes
 _RX_GRAPH_EDGE     = re.compile(r"\bedge(s)?\b", re.I)
@@ -33,51 +32,87 @@ def _load_keys():
 def _strip(s: str) -> str:
     return (s or "").replace("\r", "")
 
-def _find_schema_in_fences(txt: str) -> Optional[Dict[str, Any]]:
-    for m in _CODE_FENCE.finditer(txt):
-        body = m.group(2).strip()
+def _json_fences(txt: str) -> List[Dict[str, Any]]:
+    objs=[]
+    for m in _CODE_FENCE.finditer(txt or ""):
+        body=m.group(2).strip()
         if not body: continue
         try:
-            obj = json.loads(body)
+            obj=json.loads(body)
             if isinstance(obj, dict):
-                return obj
+                objs.append(obj)
         except Exception:
-            pass
+            continue
+    return objs
+
+def _questionish_score(keys: List[str]) -> float:
+    # Heuristic: question-like keys contain '?' or >= 5 words, or start with interrogatives
+    qwords=("what","which","when","where","why","how")
+    score=0; n=max(1,len(keys))
+    for k in keys:
+        s=str(k).strip()
+        if "?" in s: score+=1.0; continue
+        if len(s.split())>=5: score+=0.8; continue
+        if s.lower().startswith(qwords): score+=0.7; continue
+    return score/n
+
+def _rowish_score(keys: List[str]) -> float:
+    # Heuristic for sample rows / schemas (short, snake/camel keys)
+    score=0; n=max(1,len(keys))
+    for k in keys:
+        s=str(k)
+        if len(s.split())<=2 and (("_" in s) or (s.islower() and s.isidentifier())):
+            score+=1.0
+    return score/n
+
+def _find_best_object_schema(txt: str) -> Optional[Dict[str, Any]]:
+    cands=_json_fences(txt)
+    if not cands: return None
+    # prefer the dict whose keys look like user questions, not sample row columns
+    best=None; best_sc=-1
+    for d in cands:
+        keys=list(d.keys())
+        qsc=_questionish_score(keys)
+        rsc=_rowish_score(keys)
+        sc=qsc - 0.3*rsc
+        if sc>best_sc:
+            best_sc=sc; best=d
+    # keep only if sufficiently questionish
+    if best and _questionish_score(list(best.keys()))>=0.5:
+        return best
     return None
 
 def _extract_questions_locally(txt: str) -> List[str]:
     lines = _strip(txt).split("\n")
     out: List[str] = []
-    # Prefer “Questions” section if it exists
+    # Prefer “Questions/Tasks” section if present
     start = 0
     for i, ln in enumerate(lines):
         if re.search(r"^\s*(questions|tasks)\s*[:\-]?\s*$", ln, re.I):
             start = i + 1
             break
     lines = lines[start:]
-
     # numbered
     for ln in lines:
         m = _NUM.match(ln)
         if m: out.append(m.group(2).strip())
-    if out:
-        return out
+    if out: return out
     # bullets
     bul = _BUL.findall("\n".join(lines))
-    if bul:
-        return [b.strip() for b in bul if b.strip()]
+    if bul: return [b.strip() for b in bul if b.strip()]
     # fallback single
     t = txt.strip()
     return [t] if t else []
 
 def _detect_format_and_schema(txt: str) -> Dict[str, Any]:
     txt = _strip(txt)
-    # Only treat as object if explicitly requested
     if re.search(r"respond\s+with\s+a\s+json\s+object", txt, re.I):
-        schema = _find_schema_in_fences(txt)
-        # schema is optional; object_keys may be inferred by LLM later
-        return {"type": "object", "schema": schema, "object_keys": list(schema.keys()) if isinstance(schema, dict) else None}
-    # If a JSON object is embedded but not requested as return format, ignore it (likely sample row)
+        schema = _find_best_object_schema(txt)
+        return {
+            "type": "object",
+            "schema": schema,
+            "object_keys": list(schema.keys()) if isinstance(schema, dict) else None
+        }
     return {"type": "array", "schema": None, "object_keys": None}
 
 def _infer_qtype(q: str) -> str:
@@ -101,26 +136,24 @@ def _infer_qtype(q: str) -> str:
 def _ask_openai(question_text: str) -> Optional[Dict[str, Any]]:
     try:
         import openai
-        client = openai.OpenAI()
-        sys = (
-            "Contract decider. Decide output {'type':'array'|'object','schema':object|null} "
-            "then list questions in order, then coarse qtypes per question. "
-            "Only pick 'object' if the prompt explicitly asks for a JSON object; otherwise 'array'. "
-            "Return ONLY JSON: {output:{}, questions:[], qtypes:[], object_keys:null|[]}."
+        client=openai.OpenAI()
+        sys=("Contract decider. Choose output {'type':'array'|'object','schema':object|null} "
+             "ONLY pick 'object' if prompt explicitly asks. Extract ordered questions. "
+             "Infer qtypes per question. Return ONLY JSON: {output:{},questions:[],qtypes:[],object_keys:null|[]}."
         )
-        resp = client.chat.completions.create(
+        resp=client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role":"system","content":sys},
                       {"role":"user","content":question_text}],
             temperature=0, response_format={"type":"json_object"},
         )
-        obj = json.loads(resp.choices[0].message.content)
-        out = obj.get("output") or {}
-        typ = out.get("type") or "array"
-        sch = out.get("schema") if isinstance(out.get("schema"), dict) else None
-        q   = obj.get("questions") or []
-        qt  = obj.get("qtypes") or ["generic"] * len(q)
-        ok  = obj.get("object_keys")
+        obj=json.loads(resp.choices[0].message.content)
+        out=obj.get("output") or {}
+        typ=out.get("type") or "array"
+        sch=out.get("schema") if isinstance(out.get("schema"), dict) else None
+        q =obj.get("questions") or []
+        qt=obj.get("qtypes") or ["generic"]*len(q)
+        ok=obj.get("object_keys")
         return {"output":{"type":typ,"schema":sch},"questions":q,"qtypes":qt,"object_keys":ok}
     except Exception:
         return None
@@ -129,22 +162,20 @@ def _ask_gemini(question_text: str) -> Optional[Dict[str, Any]]:
     try:
         import google.generativeai as genai, re as _re, json as _j
         genai.configure()
-        model = genai.GenerativeModel("gemini-1.5-flash")
-        prompt = (
-            "Return ONLY JSON: {output:{type:'array'|'object',schema:null|object},questions:[],qtypes:[],object_keys:null|[]}. "
-            "Choose 'object' only if explicitly requested; else 'array'."
-        )
-        out = model.generate_content([prompt, question_text])
-        txt = (out.text or "").strip()
-        m = _re.search(r"\{[\s\S]*\}\s*$", txt)
+        model=genai.GenerativeModel("gemini-1.5-flash")
+        prompt=("Return ONLY JSON: {output:{type:'array'|'object',schema:null|object},questions:[],qtypes:[],object_keys:null|[]}. "
+                "Choose 'object' only if explicitly requested; else 'array'.")
+        out=model.generate_content([prompt, question_text])
+        txt=(out.text or "").strip()
+        m=_re.search(r"\{[\s\S]*\}\s*$", txt)
         if not m: return None
-        obj = _j.loads(m.group(0))
-        outp = obj.get("output") or {}
-        typ = outp.get("type") or "array"
-        sch = outp.get("schema") if isinstance(outp.get("schema"), dict) else None
-        q   = obj.get("questions") or []
-        qt  = obj.get("qtypes") or ["generic"] * len(q)
-        ok  = obj.get("object_keys")
+        obj=_j.loads(m.group(0))
+        outp=obj.get("output") or {}
+        typ=outp.get("type") or "array"
+        sch=outp.get("schema") if isinstance(outp.get("schema"), dict) else None
+        q  =obj.get("questions") or []
+        qt =obj.get("qtypes") or ["generic"]*len(q)
+        ok =obj.get("object_keys")
         return {"output":{"type":typ,"schema":sch},"questions":q,"qtypes":qt,"object_keys":ok}
     except Exception:
         return None
@@ -166,15 +197,19 @@ async def build_contract(question_text: str, workdir: str) -> Dict[str, Any]:
         if len(decided["questions"]) >= len(questions):
             questions = decided["questions"]
         if decided.get("output"):
-            if decided["output"]["type"] == "object" and not fmt["schema"]:
-                # Only accept object if explicit; else keep local fmt
+            # Keep 'object' only if explicitly requested
+            if decided["output"]["type"] == "object":
                 if re.search(r"respond\s+with\s+a\s+json\s+object", question_text, re.I):
-                    fmt["type"] = "object"; fmt["schema"] = decided["output"].get("schema")
+                    fmt["type"]="object"; fmt["schema"]=decided["output"].get("schema")
+                    if not fmt.get("object_keys") and fmt["schema"]:
+                        fmt["object_keys"] = list(fmt["schema"].keys())
+                else:
+                    fmt["type"]="array"; fmt["schema"]=None
             else:
-                fmt["type"] = decided["output"]["type"]
-                fmt["schema"] = decided["output"].get("schema")
+                fmt["type"]=decided["output"]["type"]; fmt["schema"]=decided["output"].get("schema")
         qtypes = decided.get("qtypes") or qtypes
-        fmt["object_keys"] = decided.get("object_keys", fmt.get("object_keys"))
+        if decided.get("object_keys"):
+            fmt["object_keys"] = decided.get("object_keys")
 
     contract = {"output":{"type":fmt["type"],"schema":fmt["schema"]},
                 "questions":questions, "qtypes":qtypes,
