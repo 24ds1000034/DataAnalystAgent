@@ -1,6 +1,0 @@
-You are to write executable Python code to answer the given questions using provided datasets.
-Requirements:
-- Use pandas, polars, duckdb, matplotlib, networkx as needed
-- Output results in JSON or base64 PNG strings
-- No network access, no file deletion
-Return ONLY the code, no explanation.

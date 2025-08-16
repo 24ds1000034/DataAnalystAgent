@@ -1,7 +1,0 @@
-Map semantic fields to actual column names for the chosen table(s).
-
-Semantics: ['rank','peak','year','title','metric'].
-Return ONLY JSON:
-{"column_map": {"rank": "Rank", "peak": "Peak", "year": "Year", "title": "Title", "metric": "Worldwide gross"}}
-- Values must be null or one of the provided column names.
-- No other keys. No commentary.

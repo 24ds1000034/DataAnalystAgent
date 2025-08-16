@@ -1,27 +1,41 @@
-# Python
+# Virtual envs
+.venv/
+venv/
+venv*/ 
+
+# Python junk
 __pycache__/
 *.py[cod]
 *.pyo
 *.pyd
-*.egg-info/
-*.log
+*.so
 
-# Venv
-.venv/
-.env
-
-# OS/editor
-.DS_Store
-Thumbs.db
+# Editors/OS
 .vscode/
+.idea/
+.DS_Store
 
-# Outputs & artifacts
-output/
-!output/.gitkeep
-Data_Analyst_Agent_Blueprint.md
+# Local env & secrets
+.env
+*.key
+*.pem
 
-# Plots or temporary files from codegen (optional)
-*.png
-*.svg
-    
+# Build/test artifacts
+dist/
+build/
+*.egg-info/
+.coverage
+.pytest_cache/
+
+# App runtime files
+uploads/
+!uploads/.gitkeep
+logs/
+*.log
+*.sqlite3
+
+# Caches
+.cache/
+
+tests/
 *.zip

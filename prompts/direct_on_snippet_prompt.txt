@@ -1,4 +1,0 @@
-You are given a small CSV snippet and a list of questions.
-Answer STRICTLY using only the provided snippet. If the snippet lacks the info, respond null at that position.
-Return ONLY a JSON array with one element per question, in order. No explanations or extra text.
-If a question asks for a plot, return null (this track does not produce images).

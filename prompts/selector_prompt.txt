@@ -1,8 +1,0 @@
-You select which fetched tables matter.
-
-Input: questions + tables_manifest.json (for each table: name, columns, head preview).
-
-Return ONLY JSON:
-{"chosen":["table_1.csv"], "role":{"table_1.csv":"primary"}}
-- chosen must be subset of manifest names; choose at most 2.
-- No commentary.
