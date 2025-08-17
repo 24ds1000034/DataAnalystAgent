@@ -66,11 +66,15 @@ def _normalize_import_name(pkg_name: str) -> str:
     return mapping.get(base, base.replace("-", "_"))
 
 
+# 1) Signature: default interpreter + optional knobs
 async def run_python_code(
     code: str,
     libraries: List[str],
     folder: str = "uploads",
-    python_exec: str | None = None,
+    python_exec: str | None = sys.executable,   # ← default like Code 1
+    log_path: str | None = None,                # ← allow caller to choose
+    compact: bool = False,                      # ← Code 1-style lean returns
+    run_in_workdir: bool = True,                # ← isolate I/O per job
 ) -> dict:
     # Resolve interpreter
     try:
