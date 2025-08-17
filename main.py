@@ -1,13 +1,11 @@
-from fastapi import FastAPI, Request, Response
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse ,Response
 from fastapi.middleware.cors import CORSMiddleware
 import os
 import uuid
 import sys
 import json
 import logging
-from fastapi.responses import HTMLResponse
-import difflib
 import aiofiles
 import time
 import itertools
@@ -131,7 +129,7 @@ async def analyze(request: Request):
 
             # If it's questions.txt, read its content
             if value.filename == "question.txt":
-                async with aiofiles.open(file_path, "r", encoding="utf-8") as f:
+                async with aiofiles.open(selected_file_path, "r", encoding="utf-8", errors="ignore") as f:
                     question_text = await f.read()
         else:
             saved_files[field_name] = value
@@ -193,6 +191,7 @@ You must always answer in **valid JSON** like this:
 - Save final answers in {request_folder}/result.txt (or {request_folder}/result.json if structured).  
 - Always prepend file access with {request_folder}/filename.  
 - Use only necessary pip-installable external libraries.  
+- When working with tabular data, FIRST normalize column names: trim, collapse internal spaces, and lowercase. Log both ORIGINAL and NORMALIZED column lists to {request_folder}/metadata.txt. If a required column (e.g., “worldwide gross”) is not present after normalization, stop and write a clear error with the available columns.
 
 Example Output: if asked to send a JSON like this:
 ["What is the meadian of data", "What is mean", "provide base64 image"]
