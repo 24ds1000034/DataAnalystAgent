@@ -1,9 +1,9 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import os
 import uuid
-import aiofiles
+import sys
 import json
 import logging
 from fastapi.responses import HTMLResponse
@@ -12,7 +12,6 @@ import aiofiles
 import time
 import itertools
 import re
-from fastapi import Response
 
 from task_engine import run_python_code
 from gemini import parse_question_with_llm
@@ -27,7 +26,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 @app.get("/", tags=["health"])
 async def root():
     # simple, no file I/O, always 200
@@ -41,6 +39,7 @@ async def root_head():
 @app.get("/healthz", tags=["health"])
 async def healthz():
     return {"status": "ok"}
+
 
 
 UPLOAD_DIR = "uploads"
@@ -131,31 +130,27 @@ async def analyze(request: Request):
             saved_files[field_name] = file_path
 
             # If it's questions.txt, read its content
-            if field_name == "question.txt":
-                async with aiofiles.open(file_path, "r") as f:
+            if value.filename == "question.txt":
+                async with aiofiles.open(file_path, "r", encoding="utf-8") as f:
                     question_text = await f.read()
         else:
             saved_files[field_name] = value
 
     # Fallback: If no questions.txt, use the first file as question
-    if question_text is None and saved_files:
-        target_name = "question.txt"
-        file_names = list(saved_files.keys())
+    # Fallback: if no question.txt, pick any uploaded file path
+    if question_text is None:
+        file_paths = [p for p in saved_files.values() if isinstance(p, str) and os.path.isfile(p)]
+        if file_paths:
+            preferred = next((p for p in file_paths if os.path.basename(p).lower() == "question.txt"), None)
+            selected_file_path = preferred or file_paths[0]
+            async with aiofiles.open(selected_file_path, "r", encoding="utf-8") as f:
+                question_text = await f.read()
 
-        # Find the closest matching filename
-        closest_matches = difflib.get_close_matches(target_name, file_names, n=1, cutoff=0.6)
-        if closest_matches:
-            selected_file_key = closest_matches[0]
-        else:
-            selected_file_key = next(iter(saved_files.keys()))  # fallback to first file
-
-        selected_file_path = saved_files[selected_file_key]
-
-        async with aiofiles.open(selected_file_path, "r") as f:
-            question_text = await f.read()
-
-    python_exec = next(venv_cycle)  # pick next venv
+    python_exec = next(venv_cycle)
+    if not os.path.isfile(python_exec):
+        python_exec = sys.executable
     logger.info("Using Python executable: %s", python_exec)
+
 
     user_prompt = f"""
 I know nothing about data analytics. To solve my question, follow this exact process:
@@ -198,10 +193,18 @@ You must always answer in **valid JSON** like this:
 - Save final answers in {request_folder}/result.txt (or {request_folder}/result.json if structured).  
 - Always prepend file access with {request_folder}/filename.  
 - Use only necessary pip-installable external libraries.  
+
+Example Output: if asked to send a JSON like this:
+["What is the meadian of data", "What is mean", "provide base64 image"]
+
+Then, send result like this:
+
+[20, 25, "base64 image  url here"]
+I mean don't send answers like key:answer, unless it is specified.
 """
 
 
-    question_text = str("<question>") +  question_text+ "</question>"  + str(user_prompt)
+    question_text = f"<question>{question_text or ''}</question>{user_prompt}"
     logger.info("Step-2: File sent %s", saved_files)
 
     """
@@ -257,7 +260,8 @@ You must always answer in **valid JSON** like this:
     "}"
 )
 
-            logger.error("❌🤖 Step-1: Error in parsing the result. %s", retry_message)
+            logger.error(f"❌🤖 Step-1: Error in parsing the result. {retry_message}")
+
         attempt += 1
 
 
@@ -477,6 +481,7 @@ You must always answer in **valid JSON** like this:
         result_file = os.path.join(request_folder, "result.txt")
         if not os.path.exists(result_file):
             logger.error("❌📁 result.txt not found.")
+            return JSONResponse({"message": "No result.json or result.txt produced."})
 
         # Code for reading result.txt
         with open(result_file, "r") as f:

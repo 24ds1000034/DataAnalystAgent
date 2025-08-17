@@ -1,97 +1,119 @@
-FastAPI LLM Orchestrator (Railway Deploy)
+# FastAPI LLM Orchestrator (Railway Deploy)
 
-This service accepts a question.txt and optional files/URLs, generates scraping/analysis code via LLM, executes it in a sandboxed job folder, and returns the final result.json/result.txt.
+This service accepts a `question.txt` and optional files/URLs, asks Gemini to generate scraping/analysis code, executes that code in a sandboxed job folder, and returns the final `result.json` / `result.txt`.
 
 No ngrok or shell scripts required. Deploy directly to Railway or run locally.
 
-🚀 Features
+---
 
-FastAPI API with permissive CORS
+## 🚀 Features
 
-Per-request sandbox folder under uploads/<request_id>/job_*
+- **FastAPI** API with permissive CORS
+- **Per-request sandbox**: data lives under `uploads/<request_id>/`
+- **Async-safe execution engine** (`task_engine.py`) with:
+  - Per-job working dir: `uploads/<request_id>/job_<8hex>/`
+  - On-demand library installs (with mapping like `beautifulsoup4 → bs4`)
+  - Timeouts and structured logs (`execution_result.txt`)
+- **Gemini integration** (`gemini.py`) that uses **API key from environment** (no hardcoded keys)
+- **Robust retries** for JSON-only LLM responses
+- **Health checks** at `/`, `/healthz`, and `HEAD /`
 
-Auto-install of common Python libs requested by the LLM (with safety timeouts)
+---
 
-Logs per request (uploads/<request_id>/execution_result.txt)
+## 📦 Repo Structure
 
-Tolerant health check route at /
-
-Works great with cURL
-
-📦 What’s in this repo
+```
 .
-├─ main.py
-├─ task_engine.py
-├─ gemini.py
-├─ llm_parser.py           # optional; not called by main.py
-├─ requirements.txt        # Railway installs from this
-├─ Procfile                # or railway.toml (choose one)
-├─ .env.example
+├─ main.py                   # FastAPI app & orchestration loop
+├─ task_engine.py            # Async code runner + pip installer
+├─ gemini.py                 # Gemini client & parse_question_with_llm()
+├─ requirements.txt          # Deps installed by Railway / local
+├─ Procfile                  # (Option A) Process declaration for Railway
+├─ railway.toml              # (Option B) Railway config (use one of the two)
+├─ .env.example              # Template for environment variables
 ├─ .gitignore
 ├─ uploads/
-│  └─ .gitkeep             # keep folder in git; runtime data is ephemeral
+│  └─ .gitkeep               # Keep folder in git; runtime data is ephemeral
 └─ README.md
+```
 
-🔧 Requirements
+Everything routes through `gemini.py`.
 
-Python 3.13.5 (set on Railway via variable PYTHON_VERSION=3.13.5; if any package fails, switch to 3.12.x)
+---
 
-requirements.txt (provided)
+## 🔧 Requirements
 
-🔑 Environment Variables
+- **Python** 3.12.x or 3.13.x  
+  - On Railway, set `PYTHON_VERSION=3.13.5` (if any wheel fails to build, try 3.12.x).
+- `requirements.txt` (provided)
 
-Create a .env locally (don’t commit it) or set these in Railway → Variables:
+---
 
-GENAI_API_KEY=your_gemini_api_key    # required (used by gemini.py)
-AIPIPE_TOKEN=your_openrouter_token   # optional (only for llm_parser.py)
-PYTHON_VERSION=3.13.5                # recommended on Railway
+## 🔑 Environment Variables
 
+Create a `.env` locally (do **not** commit it) or set these in Railway → **Variables**:
 
-Security note: Remove any hardcoded keys from gemini.py system prompts.
+- `GENAI_API_KEY` — your Google Gemini API key **(required)**  
+- `PYTHON_VERSION` — e.g. `3.13.5` (recommended on Railway)
 
-A sample .env.example is included.
+> **Security:** `gemini.py` reads the key from the environment. There are **no hardcoded keys** in prompts or code.
 
-▶️ Run Locally
+Example `.env.example`:
+
+```bash
+GENAI_API_KEY=your_gemini_api_key_here
+PYTHON_VERSION=3.13.5
+```
+
+---
+
+## ▶️ Run Locally
+
+```bash
 # 1) create & activate venv (Windows PowerShell shown; adjust for macOS/Linux)
 python -m venv .venv
-.venv\Scripts\activate
+. .venv/Scripts/activate    # Windows
+# source .venv/bin/activate # macOS/Linux
 
 # 2) install deps
 pip install -r requirements.txt
 
 # 3) set env vars (or use a .env file)
-set GENAI_API_KEY=your_key_here
+set GENAI_API_KEY=your_key_here     # Windows
+# export GENAI_API_KEY=your_key_here  # macOS/Linux
 
 # 4) start server
 uvicorn main:app --host 0.0.0.0 --port 8000
+```
 
+**Health check**:
 
-Health check:
+```
+GET http://localhost:8000/   →  { "ok": true, ... }
+GET http://localhost:8000/healthz
+HEAD /
+```
 
-GET http://localhost:8000/   → { "ok": true, ... }
+---
 
-☁️ Deploy to Railway
-Option A: Procfile (simple)
+## ☁️ Deploy to Railway
 
-Procfile
+### Option A: **Procfile** (simple)
 
+**Procfile**
+```
 web: uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}
-
+```
 
 Push to GitHub → Create a new Railway project → Deploy from repo.
 
 Set Variables:
+- `GENAI_API_KEY`
+- `PYTHON_VERSION=3.13.5` (or 3.12.x)
 
-GENAI_API_KEY
+### Option B: **railway.toml** (alternative)
 
-(optional) AIPIPE_TOKEN
-
-PYTHON_VERSION=3.13.5
-
-Option B: railway.toml (alternative)
-
-If you prefer, use railway.toml instead of a Procfile:
-
+```toml
 [build]
 builder = "NIXPACKS"
 
@@ -99,67 +121,89 @@ builder = "NIXPACKS"
 startCommand = "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 3
+```
 
+> Use **either** `Procfile` **or** `railway.toml`, not both.
 
-Make sure you use either Procfile or railway.toml, not both.
+---
 
-📡 API
-POST /api
+## 📡 API
 
-Accepts multipart/form-data.
+### `POST /api`
+Accepts `multipart/form-data`.
 
-Recommended field: question.txt=@/path/to/question.txt
+- Recommended field: `question.txt=@/path/to/question.txt`
+- You may attach additional files: `-F "file1=@/path/to/file.csv"`
+- You can also include plain text fields: `-F "note=anything"`
 
-You may attach additional files: -F "data=@/path/to/file.csv"
-
-You can also include text fields: -F "note=anything"
-
-cURL example (Linux/macOS):
-
+**cURL (Linux/macOS):**
+```bash
 curl -X POST "http://localhost:8000/api" \
   -H "Accept: application/json" \
   -F "question.txt=@tests/question1.txt" \
   -F "file1=@tests/sample.csv"
+```
 
-
-cURL example (Windows PowerShell):
-
+**cURL (Windows PowerShell):**
+```powershell
 curl.exe -X POST "http://localhost:8000/api" `
   -H "Accept: application/json" `
   -F "question.txt=@tests\question1.txt" `
   -F "file1=@tests\sample.csv"
+```
 
+**Response**
+- **Success**: the JSON content of `uploads/<request_id>/result.json`
+- **Failure**: `{"message": "...error..."}`; see logs at `uploads/<request_id>/execution_result.txt`
 
-Response
+---
 
-On success: contents of uploads/<request_id>/result.json (JSON)
-
-On failure: {"message": "...error..."} plus logs in uploads/<request_id>/execution_result.txt
-
-🗂️ Runtime Files & Logs
+## 🗂️ Runtime Files & Logs
 
 Per request (UUID):
 
+```
 uploads/<request_id>/
 ├─ app.log
-├─ execution_result.txt        # combined engine logs
+├─ execution_result.txt        # combined engine logs (install/run output)
 ├─ metadata.txt                # intermediate info saved by generated code
 ├─ result.json / result.txt    # final answer
 └─ job_<8hex>/
    └─ script.py                # executed code
+```
 
+> Railway storage is **ephemeral**. Do not rely on `uploads/` for persistence.
 
-Railway storage is ephemeral. Do not rely on uploads/ for persistence.
+---
 
-🧪 Health Checks
+## 🧠 How It Works (High Level)
 
-Keep the tolerant root route (JSON 200) so Railway health checks pass:
+1. `main.py` receives `question.txt` (+ optional files).  
+2. `gemini.py::parse_question_with_llm()` prompts Gemini to **return JSON only** containing:
+   - `code` (Python), `libraries` (pip names), `run_this` (0/1)
+3. `task_engine.py::run_python_code()`
+   - Ensures required libraries are available (maps names like `beautifulsoup4 → bs4` for import checks)
+   - Writes `script.py` in a per-job folder and executes it (async-safe, with timeouts)
+   - Captures stdout/stderr to `execution_result.txt`
+4. The code writes `metadata.txt` (intermediate) and `result.json` or `result.txt` (final).  
+5. If needed, `main.py` asks Gemini to **validate** the output and optionally **re-generate** code.  
+6. The API returns `result.json` (or `result.txt` fallback).
 
-GET /
-GET /healthz  (optional)
-HEAD /
+---
 
-📝 .gitignore (key entries)
+## 🧪 Health Checks
+
+Keep tolerant routes for platform probes:
+
+- `GET /`
+- `GET /healthz`
+- `HEAD /`
+
+---
+
+## 📝 .gitignore (key entries)
+
+```gitignore
 # Virtualenvs
 .venv/
 venv*/
@@ -178,8 +222,13 @@ logs/
 .DS_Store
 .vscode/
 .idea/
+```
 
-📄 requirements.txt (preinstalled to avoid slow first runs)
+---
+
+## 📄 requirements.txt (preinstalled to avoid slow first runs)
+
+```txt
 # Web stack
 fastapi>=0.115
 uvicorn[standard]>=0.30
@@ -204,27 +253,38 @@ lxml>=5.2
 numpy>=2.0
 matplotlib>=3.9
 seaborn>=0.13
+```
 
-🛠️ Troubleshooting
+---
 
-FileNotFoundError: .../script.py
-Fixed in task_engine.py (we write script.py before executing).
+## 🛠️ Troubleshooting
 
-Writes to uploads/<uuid>/... fail
-We execute script.py with cwd set to project root so those relative paths resolve.
+- **`TypeError: can only concatenate str (not "NoneType") to str`**  
+  Ensure `question.txt` was received and read properly before concatenating into the prompt. Your current `main.py` reads it from form-data or falls back to the first uploaded file.
 
-Repeated beautifulsoup4 installs
-Import check maps beautifulsoup4 → bs4, scikit-learn → sklearn, etc.
+- **`FileNotFoundError: .../script.py`**  
+  `task_engine.py` writes `script.py` before executing; verify the job folder exists and has write permissions.
 
-Pip hangs
-We apply a 300s timeout and disable version prompts. If a package consistently fails, pin Python to 3.12.x.
+- **Library import checks keep reinstalling**  
+  The engine maps common pip names to import names (`beautifulsoup4 → bs4`, `scikit-learn → sklearn`, `opencv-python → cv2`, etc.). Ensure your package list uses pip names, not import names.
 
-⚠️ Security Notes
+- **Pip hangs or slow builds**  
+  Railway Nixpacks + Python 3.13.5 generally works. If wheels fail to build, try `PYTHON_VERSION=3.12.x`.
 
-Never commit .env or API keys.
+- **Using multiple venvs**  
+  If you round-robin interpreters, make sure the paths you pick actually exist on Railway. You can also default to `sys.executable`.
 
-Remove any hardcoded keys from prompts/system instructions.
+---
 
-This service can fetch URLs supplied via prompts; validate inputs if exposing publicly.
+## ⚠️ Security Notes
 
-That’s it—commit, push, set Railway variables, and deploy.
+- **Never** commit `.env` or API keys.
+- Keep keys **out of prompts and logs**.
+- This service can fetch URLs supplied via prompts; **validate inputs** if exposing publicly.
+- Consider rate-limiting and auth if you deploy the endpoint on a public URL.
+
+---
+
+## License
+
+MIT (or your preferred license).
