@@ -1,5 +1,5 @@
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse ,Response
 from fastapi.middleware.cors import CORSMiddleware
 import os
 import uuid
@@ -185,6 +185,13 @@ You must always answer in **valid JSON** like this:
     "libraries": ["list", "of", "external_libraries"],
     "run_this": 1 or 0
 }}
+
+### Charts (only if asked)
+- Do **not** create any chart unless the question explicitly asks for one.
+- When the question includes chart details, follow them **exactly** (chart type, columns, colors, styles such as “dotted red regression line”, return format, size limits, etc.).
+- Use matplotlib unless the question specifies another library.
+- If a size limit is given (e.g., “under 100,000 bytes”), tune `dpi`/`figsize` and save to `{request_folder}/chart.png`, then return a base64 **data URI** string that starts with `data:image/png;base64,`.
+- If the question doesn’t mention charts, skip chart code entirely.
 
 ### Additional Rules:
 - Save extracted info into {request_folder}/metadata.txt (append mode).  
