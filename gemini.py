@@ -1,17 +1,8 @@
 import os
 import json
 import google.generativeai as genai
-from dotenv import load_dotenv
+from api_key_rotator import get_api_key
 
-load_dotenv()
-
-# Get the API key from environment variable
-api_key = os.getenv("GENAI_API_KEY")
-
-if not api_key:
-    raise ValueError("GENAI_API_KEY environment variable is not set.")
-
-genai.configure(api_key=api_key)
 
 MODEL_NAME = "gemini-2.5-pro"
 
@@ -19,6 +10,26 @@ MODEL_NAME = "gemini-2.5-pro"
 generation_config = genai.types.GenerationConfig(
     response_mime_type="application/json"
 )
+
+
+async def send_with_rotation(prompt, session_id, system_prompt):
+    while True:
+        try:
+            api_key = get_api_key(auto_wait=True)
+            genai.configure(api_key=api_key)
+
+            chat = await get_chat_session(parse_chat_sessions, session_id, system_prompt)
+            response = chat.send_message(prompt)
+
+            if '"finish_reason": "STOP"' in str(response):
+               print("Response finished with STOP")
+               continue
+
+            return response
+
+        except Exception as e:
+            print(f"⚠️ API key {api_key} failed: {e}. Retrying with another key...")
+            continue
 
 
 # Store chat sessions for both parsing and answering
@@ -56,7 +67,7 @@ You are an AI Python code generator for multi-step data analysis and processing.
 
 ## Resources
 - Primary LLM: Google Gemini
-- API Key: read from environment variable (never include or print credentials)
+- API Key: {"AIzaSyBxddEHeeSs8ovD4thaYLkA5tk1fo1zxFE"}
 - Working Folder: {folder}
 
 ## Capabilities
@@ -83,26 +94,20 @@ You are an AI Python code generator for multi-step data analysis and processing.
 - Always prefer incremental steps.  
 - Append **only necessary information** to {folder}/metadata.txt to minimize token usage.  
 - Use pip-installable names for external libraries. Built-ins should not be listed.
-- For image processing, use Python libraries or other gemini model that is working.(no Gemini Vision). 
-
-## Charts (on-demand)
-- Do **not** make charts unless the user’s question asks for one.
-- If the question specifies chart requirements (type, axes, colors/styles like a dotted red regression line, image size limits, output format), follow those **exactly**.
-- Prefer matplotlib unless another library is explicitly required.
-- If a byte-size limit is given, adjust `dpi`/`figsize` to keep the PNG under that limit, save to {folder}/chart.png, and return a base64 data URI (`data:image/png;base64,...`) when asked.
-
+- For image processing, use Python libraries or other gemini model that is working.
+- Do not generate random data after a single attempt. Instead, if the first approach fails, try solving the problem again using the provided data but with a different method.  
+- All the uploaded files will be in the folder {folder}. You can access them like this {folder}/filename.
 """
 
 
 
     chat =await get_chat_session(parse_chat_sessions, session_id, SYSTEM_PROMPT)
 
-    if retry_message is not None:
+    if retry_message:
+        # Only send error/retry message
         prompt = retry_message
-    elif question_text is not None:
-        prompt = question_text
     else:
-        raise ValueError("parse_question_with_llm: both question_text and retry_message are None")
+        prompt = question_text
     
     # Path to the file
     file_path = os.path.join(folder, "metadata.txt")
@@ -116,25 +121,23 @@ You are an AI Python code generator for multi-step data analysis and processing.
     # Access chat history
     # Example: Save to JSON   
 
-    # Sending response
-    response = chat.send_message(prompt)
-
-    # Save chat history after this turn
     history_data = []
     for msg in chat.history:
         history_data.append({
             "role": msg.role,
-            "parts": [str(p) for p in msg.parts]
+            "parts": [str(p) for p in msg.parts]  # convert parts to string
         })
     chat_history_path = os.path.join(folder, "chat_history.json")
     with open(chat_history_path, "w") as f:
         json.dump(history_data, f, indent=2)
-
-
+    
+    # Sending response
+    response =await send_with_rotation(prompt, session_id, SYSTEM_PROMPT)
 
     try:
         return json.loads(response.text)
-    except json.JSONDecodeError:
-        raise ValueError(f"Model returned non-JSON: {response.text[:500]}")
+    except:
+        print(response)
+
     
-    
+

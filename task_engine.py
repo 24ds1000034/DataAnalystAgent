@@ -4,35 +4,16 @@ import traceback
 from typing import List
 import datetime
 import os
-import asyncio
-import uuid
-
-import re
-
-try:
-    import black  # optional code formatter
-except Exception:
-    black = None
-
-
-def _normalize_import_name(pkg: str) -> str:
-    base = re.split(r"[<>=!~\[]", pkg.strip(), maxsplit=1)[0].lower()
-    mapping = {
-        "beautifulsoup4": "bs4",
-        "scikit-learn": "sklearn",
-        "opencv-python": "cv2",
-        "pillow": "PIL",
-        "pyyaml": "yaml",
-        "python-dotenv": "dotenv",
-        "google-generativeai": "google.generativeai",
-    }
-    return mapping.get(base, base.replace("-", "_"))
+import black
+import itertools
+import tempfile
+import textwrap
 
 
 async def run_python_code(code: str, libraries: List[str], folder: str = "uploads", python_exec = sys.executable) -> dict:
 
     # Create a unique work directory per run
-    work_dir = os.path.join(folder, f"job_{uuid.uuid4().hex[:8]}")
+    work_dir = os.path.join(folder, f"job_")
     os.makedirs(work_dir, exist_ok=True)
 
     # Ensure the folder exists
@@ -51,17 +32,16 @@ async def run_python_code(code: str, libraries: List[str], folder: str = "upload
     for lib in libraries:
         try:
             # check if already installed
-            import_name = _normalize_import_name(lib)
             check_cmd = [
                 python_exec,
                 "-c",
                 f"import importlib.util, sys; "
-                f"sys.exit(0) if importlib.util.find_spec('{import_name}') else sys.exit(1)"
+                f"sys.exit(0) if importlib.util.find_spec('{lib}') else sys.exit(1)"
             ]
-            result = await asyncio.to_thread(subprocess.run, check_cmd)
+            result = subprocess.run(check_cmd)
             if result.returncode != 0:  # not installed
                 log_to_file(f"📦 Installing {lib} ...")
-                await asyncio.to_thread(subprocess.check_call, [python_exec, "-m", "pip", "install", lib, "--upgrade", "--disable-pip-version-check", "--no-input"])
+                subprocess.check_call([python_exec, "-m", "pip", "install", lib])
             else:
                 log_to_file(f"✅ {lib} already installed.")
         except Exception as install_error:
@@ -71,29 +51,24 @@ async def run_python_code(code: str, libraries: List[str], folder: str = "upload
 
     # Step 2: Run the code in the isolated venv
     try:
-        if black:
-            try:
-                code_formatted = black.format_str(code, mode=black.Mode())
-            except Exception:
-                code_formatted = code
-        else:
-            code_formatted = code
+        try:
+            code_formatted = black.format_str(code, mode=black.Mode())
+        except Exception:
+            code_formatted = code  # fallback if formatting fails
 
         log_to_file(f"📜 Executing Code:\n{code_formatted}")
 
         # Save code to job-specific file
         code_file_path = os.path.join(work_dir, "script.py")
-        with open(code_file_path, "w", encoding="utf-8", newline="\n") as f:
-            f.write(code_formatted)
-        # Run in subprocess with chosen venv
-        result = await asyncio.to_thread(
-        subprocess.run,
-        [python_exec, code_file_path],
-        capture_output=True,
-        text=True,
-        timeout=600
-        )
+        with open(code_file_path, "w") as f:
+            f.write(code)
 
+        # Run in subprocess with chosen venv
+        result = subprocess.run(
+            [python_exec, code_file_path],
+            capture_output=True,
+            text=True
+        )
 
         if result.returncode == 0:
             success_message = f"✅ Code executed successfully:\n{result.stdout}"
